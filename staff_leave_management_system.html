@@ -1,0 +1,1111 @@
+<!DOCTYPE html>
+<html lang="zh-HK">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>產品組請假系統</title>
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Inter Font -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <!-- FontAwesome Icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        body { font-family: 'Inter', sans-serif; }
+        /* Custom scrollbar for calendar cell */
+        .cell-scroll::-webkit-scrollbar {
+            width: 3px;
+        }
+        .cell-scroll::-webkit-scrollbar-thumb {
+            background: #cbd5e1;
+            border-radius: 4px;
+        }
+    </style>
+</head>
+<body class="bg-slate-50 text-slate-800 min-h-screen flex flex-col">
+
+    <!-- App Container -->
+    <div id="app" class="max-w-md mx-auto w-full flex-1 flex flex-col bg-white shadow-xl relative overflow-hidden">
+        <!-- Dynamic Content Rendered Here -->
+    </div>
+
+    <!-- Custom Modal -->
+    <div id="custom-modal" class="fixed inset-0 bg-black/50 z-50 hidden flex items-center justify-center p-4">
+        <div class="bg-white rounded-2xl max-w-sm w-full p-6 shadow-2xl transform transition-all">
+            <div id="modal-icon" class="text-3xl mb-3 text-emerald-600"></div>
+            <h3 id="modal-title" class="text-lg font-bold text-slate-900 mb-2">提示</h3>
+            <div id="modal-message" class="text-slate-600 text-sm mb-6 leading-relaxed"></div>
+            <div id="modal-buttons" class="flex gap-3 justify-end">
+                <button id="modal-ok-btn" class="flex-1 bg-emerald-600 text-white font-medium py-2.5 px-4 rounded-xl hover:bg-emerald-700 transition">確定</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Firebase SDK Imports -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, collection, addDoc, getDocs, doc, deleteDoc, updateDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Global Firebase handles
+        let app, db, auth;
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'company-leave-system-v1';
+        
+        try {
+            const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+            if (Object.keys(firebaseConfig).length > 0) {
+                app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+            }
+        } catch(e) {
+            console.error("Firebase init error:", e);
+        }
+
+        // Application State
+        let state = {
+            view: 'login', // login, home, request, cancel, admin_home, admin_colleagues, admin_leaves, success_share
+            user: null, // { name: string, isAdmin: boolean }
+            colleagues: [], // [{ id, name, password }]
+            leaves: [], // [{ id, colleagueName, leaveType, startDate, endDate, halfDayStart, halfDayEnd, slots }]
+            holidays: {}, // { "YYYY-MM-DD": "Holiday Name" }
+            currentYear: new Date().getFullYear(),
+            selectedMonth: new Date().getMonth(), // 0-11
+            selectedYear: new Date().getFullYear(),
+            requestForm: {
+                startDate: '',
+                endDate: '',
+                halfDayStart: 'full', // 'am', 'pm', 'full'
+                halfDayEnd: 'full',
+                leaveType: 'Annual Leave'
+            },
+            lastSubmittedLeave: null,
+            adminEditTarget: null
+        };
+
+        // Custom Modal helper
+        window.showModal = function(title, message, type = 'info', onOk = null, showCancel = false, cancelText = '取消', okText = '確定') {
+            const modal = document.getElementById('custom-modal');
+            const iconEl = document.getElementById('modal-icon');
+            const titleEl = document.getElementById('modal-title');
+            const msgEl = document.getElementById('modal-message');
+            const btnContainer = document.getElementById('modal-buttons');
+
+            titleEl.innerText = title;
+            if (typeof message === 'string') {
+                msgEl.innerText = message;
+            } else {
+                msgEl.innerHTML = '';
+                msgEl.appendChild(message);
+            }
+
+            if (type === 'success') {
+                iconEl.innerHTML = '<i class="fa-solid fa-circle-check text-emerald-600"></i>';
+            } else if (type === 'warning') {
+                iconEl.innerHTML = '<i class="fa-solid fa-triangle-exclamation text-amber-500"></i>';
+            } else if (type === 'error') {
+                iconEl.innerHTML = '<i class="fa-solid fa-circle-xmark text-rose-600"></i>';
+            } else {
+                iconEl.innerHTML = '<i class="fa-solid fa-circle-info text-blue-600"></i>';
+            }
+
+            btnContainer.innerHTML = '';
+            if (showCancel) {
+                const cancelBtn = document.createElement('button');
+                cancelBtn.className = 'flex-1 bg-slate-200 text-slate-700 font-medium py-2.5 px-4 rounded-xl hover:bg-slate-300 transition';
+                cancelBtn.innerText = cancelText;
+                cancelBtn.onclick = () => {
+                    modal.classList.add('hidden');
+                };
+                btnContainer.appendChild(cancelBtn);
+            }
+
+            const okBtn = document.createElement('button');
+            okBtn.className = 'flex-1 bg-emerald-600 text-white font-medium py-2.5 px-4 rounded-xl hover:bg-emerald-700 transition';
+            okBtn.innerText = okText;
+            okBtn.onclick = () => {
+                modal.classList.add('hidden');
+                if (onOk) onOk();
+            };
+            btnContainer.appendChild(okBtn);
+
+            modal.classList.remove('hidden');
+        };
+
+        // Initialize Firebase & Listeners
+        async function initFirebase() {
+            if (!auth || !db) {
+                console.warn("Running in local mock mode without Firebase backend");
+                state.colleagues = [
+                    { id: 'c1', name: '陳大文', password: '123' },
+                    { id: 'c2', name: '李小美', password: '123' },
+                    { id: 'c3', name: '張志強', password: '123' }
+                ];
+                await fetchHolidays(state.currentYear);
+                render();
+                return;
+            }
+
+            try {
+                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                    await signInWithCustomToken(auth, __initial_auth_token);
+                } else {
+                    await signInAnonymously(auth);
+                }
+                const user = auth.currentUser;
+                if (!user) return;
+
+                // Listen to Colleagues collection
+                const colRef = collection(db, 'artifacts', appId, 'public', 'data', 'colleagues');
+                onSnapshot(colRef, (snapshot) => {
+                    state.colleagues = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                    render();
+                }, (err) => console.error("Colleagues snapshot error:", err));
+
+                // Listen to Leaves collection
+                const leaveRef = collection(db, 'artifacts', appId, 'public', 'data', 'leaves');
+                onSnapshot(leaveRef, (snapshot) => {
+                    state.leaves = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                    render();
+                }, (err) => console.error("Leaves snapshot error:", err));
+
+                await fetchHolidays(state.currentYear);
+            } catch (e) {
+                console.error("Firebase auth/sync error:", e);
+            }
+        }
+
+        // Fetch Public Holidays for HK
+        async function fetchHolidays(year) {
+            try {
+                const res = await fetch(`https://date.nager.at/api/v3/PublicHolidays/${year}/HK`);
+                if (res.ok) {
+                    const data = await res.json();
+                    state.holidays = {};
+                    data.forEach(item => {
+                        state.holidays[item.date] = item.localName;
+                    });
+                }
+            } catch(e) {
+                console.warn("Failed to fetch public holidays from API, using fallback", e);
+                state.holidays = {
+                    [`${year}-01-01`]: "元旦",
+                    [`${year}-05-01`]: "勞動節",
+                    [`${year}-07-01`]: "香港特區成立紀念日",
+                    [`${year}-10-01`]: "國慶日",
+                    [`${year}-12-25`]: "聖誕節"
+                };
+            }
+        }
+
+        // Check if date is working day (Mon-Fri and not holiday)
+        function isWorkingDay(dateStr) {
+            const d = new Date(dateStr);
+            const dayOfWeek = d.getDay();
+            if (dayOfWeek === 0 || dayOfWeek === 6) return false;
+            if (state.holidays[dateStr]) return false;
+            return true;
+        }
+
+        // Get all working days between startDate and endDate inclusive
+        function getWorkingDaysBetween(startStr, endStr) {
+            let workingDays = [];
+            let curr = new Date(startStr);
+            let end = new Date(endStr);
+            while (curr <= end) {
+                const yyyy = curr.getFullYear();
+                const mm = String(curr.getMonth() + 1).padStart(2, '0');
+                const dd = String(curr.getDate()).padStart(2, '0');
+                const dateStr = `${yyyy}-${mm}-${dd}`;
+                if (isWorkingDay(dateStr)) {
+                    workingDays.push(dateStr);
+                }
+                curr.setDate(curr.getDate() + 1);
+            }
+            return workingDays;
+        }
+
+        // Generate slots from leave request
+        function generateSlots(startDate, endDate, halfDayStart, halfDayEnd) {
+            let slots = [];
+            let workingDays = getWorkingDaysBetween(startDate, endDate);
+            
+            workingDays.forEach((day, index) => {
+                let isFirst = (index === 0);
+                let isLast = (index === workingDays.length - 1);
+
+                let dayAm = true;
+                let dayPm = true;
+
+                if (isFirst) {
+                    if (halfDayStart === 'am') dayPm = false;
+                    if (halfDayStart === 'pm') dayAm = false;
+                }
+                if (isLast) {
+                    if (halfDayEnd === 'am') dayPm = false;
+                    if (halfDayEnd === 'pm') dayAm = false;
+                }
+
+                if (dayAm) slots.push(`${day}_AM`);
+                if (dayPm) slots.push(`${day}_PM`);
+            });
+            return slots;
+        }
+
+        // Calculate used stats for current year (Jan 1 to Dec 31)
+        function getUserLeaveStats(colleagueName, year) {
+            let stats = {
+                'Sick Leave': 0,
+                'Annual Leave': 0,
+                'Birthday Leave': 0,
+                'Block Leave': 0
+            };
+
+            state.leaves.forEach(leave => {
+                if (leave.colleagueName === colleagueName) {
+                    const leaveYear = new Date(leave.startDate).getFullYear();
+                    if (leaveYear === year) {
+                        let count = (leave.slots || []).length * 0.5;
+                        if (stats[leave.leaveType] !== undefined) {
+                            stats[leave.leaveType] += count;
+                        }
+                    }
+                }
+            });
+            return stats;
+        }
+
+        // Get count of people taking leave for each specific slot
+        function getSlotOverlapCounts() {
+            let counts = {};
+            state.leaves.forEach(leave => {
+                (leave.slots || []).forEach(slot => {
+                    counts[slot] = (counts[slot] || 0) + 1;
+                });
+            });
+            return counts;
+        }
+
+        // Show details modal for a clicked date
+        window.showDateDetails = function(dateStr, dayLeaves, isRed) {
+            let container = document.createElement('div');
+            container.className = 'space-y-3 text-left border-t border-slate-100 pt-3 mt-2';
+
+            if (dayLeaves.length === 0) {
+                container.innerHTML = `<div class="text-sm text-slate-500 py-2">本日無人請假</div>`;
+            } else {
+                dayLeaves.forEach(dl => {
+                    let timeBadge = dl.am && dl.pm ? '全日' : (dl.am ? '上午 (AM)' : '下午 (PM)');
+                    container.innerHTML += `
+                        <div class="p-2.5 rounded-xl border ${isRed ? 'bg-rose-50 border-rose-200' : 'bg-slate-50 border-slate-200'} flex justify-between items-center">
+                            <div>
+                                <div class="font-bold text-slate-800 text-sm flex items-center gap-1.5">
+                                    <i class="fa-solid fa-user text-xs ${isRed ? 'text-rose-600' : 'text-emerald-600'}"></i>
+                                    <span>${dl.name}</span>
+                                </div>
+                                <div class="text-xs text-slate-500 mt-0.5">${dl.type}</div>
+                            </div>
+                            <span class="text-xs font-semibold px-2 py-1 rounded-lg ${isRed ? 'bg-rose-600 text-white' : 'bg-emerald-600 text-white'}">
+                                ${timeBadge}
+                            </span>
+                        </div>
+                    `;
+                });
+            }
+
+            showModal(`${dateStr} 請假詳情`, container, isRed ? 'error' : 'info');
+        }
+
+        // Main Render Router
+        window.render = function() {
+            const appEl = document.getElementById('app');
+            appEl.innerHTML = '';
+
+            if (state.view === 'login') {
+                appEl.innerHTML = renderLogin();
+            } else if (state.view === 'home') {
+                appEl.innerHTML = renderHome();
+            } else if (state.view === 'request') {
+                appEl.innerHTML = renderRequest();
+            } else if (state.view === 'success_share') {
+                appEl.innerHTML = renderSuccessShare();
+            } else if (state.view === 'cancel') {
+                appEl.innerHTML = renderCancel();
+            } else if (state.view === 'admin_home') {
+                appEl.innerHTML = renderAdminHome();
+            } else if (state.view === 'admin_colleagues') {
+                appEl.innerHTML = renderAdminColleagues();
+            } else if (state.view === 'admin_leaves') {
+                appEl.innerHTML = renderAdminLeaves();
+            }
+        }
+
+        // 1. Login View
+        function renderLogin() {
+            return `
+                <div class="flex-1 flex flex-col justify-center p-6 bg-gradient-to-br from-emerald-500 to-teal-700 text-white">
+                    <div class="text-center mb-8">
+                        <div class="w-20 h-20 bg-white/10 backdrop-blur rounded-3xl mx-auto flex items-center justify-center text-3xl mb-4 shadow-lg border border-white/20">
+                            <i class="fa-solid fa-calendar-days text-white"></i>
+                        </div>
+                        <h1 class="text-2xl font-bold">產品組請假系統</h1>
+                        <p class="text-emerald-100 text-sm mt-1">請選擇您的身份並登入</p>
+                    </div>
+                    <div class="bg-white text-slate-800 rounded-3xl p-6 shadow-2xl space-y-4">
+                        <div>
+                            <label class="block text-xs font-semibold uppercase tracking-wider text-slate-500 mb-1">選擇用戶</label>
+                            <select id="login-user" class="w-full bg-slate-100 border border-slate-200 rounded-xl px-4 py-3 text-slate-800 focus:outline-none focus:ring-2 focus:ring-emerald-500">
+                                <option value="admin">管理員 (Admin)</option>
+                                ${state.colleagues.map(c => `<option value="${c.name}">${c.name}</option>`).join('')}
+                            </select>
+                        </div>
+                        <div>
+                            <label class="block text-xs font-semibold uppercase tracking-wider text-slate-500 mb-1">密碼</label>
+                            <input type="password" id="login-pass" placeholder="請輸入密碼" class="w-full bg-slate-100 border border-slate-200 rounded-xl px-4 py-3 text-slate-800 focus:outline-none focus:ring-2 focus:ring-emerald-500">
+                        </div>
+                        <button onclick="handleLogin()" class="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-semibold py-3.5 rounded-xl shadow-lg shadow-emerald-600/30 transition">
+                            登入系統
+                        </button>
+                    </div>
+                </div>
+            `;
+        }
+
+        window.handleLogin = function() {
+            const selected = document.getElementById('login-user').value;
+            const pass = document.getElementById('login-pass').value;
+
+            if (selected === 'admin') {
+                if (pass === 'admin') {
+                    state.user = { name: 'Admin', isAdmin: true };
+                    state.view = 'admin_home';
+                    render();
+                } else {
+                    showModal('登入失敗', '管理員密碼錯誤 (預設為 admin)', 'error');
+                }
+            } else {
+                const colleague = state.colleagues.find(c => c.name === selected);
+                if (colleague && colleague.password === pass) {
+                    state.user = { name: colleague.name, isAdmin: false };
+                    state.view = 'home';
+                    render();
+                } else {
+                    showModal('登入失敗', '密碼錯誤或同事不存在', 'error');
+                }
+            }
+        };
+
+        // 2. Home Page (Non-admin)
+        function renderHome() {
+            const overlapCounts = getSlotOverlapCounts();
+            const months = ['一月','二月','三月','四月','五月','六月','七月','八月','九月','十月','十一月','十二月'];
+
+            const year = state.selectedYear;
+            const month = state.selectedMonth;
+            const firstDayIndex = new Date(year, month, 1).getDay();
+            const totalDays = new Date(year, month + 1, 0).getDate();
+
+            let calendarCells = '';
+            let startDay = firstDayIndex === 0 ? 6 : firstDayIndex - 1; 
+
+            for (let i = 0; i < startDay; i++) {
+                calendarCells += `<div class="h-20 bg-slate-50/50 rounded-xl border border-slate-100/50"></div>`;
+            }
+
+            for (let day = 1; day <= totalDays; day++) {
+                const mm = String(month + 1).padStart(2, '0');
+                const dd = String(day).padStart(2, '0');
+                const dateStr = `${year}-${mm}-${dd}`;
+                const isHoliday = state.holidays[dateStr];
+                const dObj = new Date(year, month, day);
+                const isWeekend = (dObj.getDay() === 0 || dObj.getDay() === 6);
+
+                let dayLeaves = [];
+                let amCount = 0;
+                let pmCount = 0;
+
+                state.leaves.forEach(l => {
+                    if ((l.slots || []).some(s => s.startsWith(dateStr))) {
+                        let am = l.slots.includes(`${dateStr}_AM`);
+                        let pm = l.slots.includes(`${dateStr}_PM`);
+                        if (am) amCount++;
+                        if (pm) pmCount++;
+                        dayLeaves.push({ name: l.colleagueName, type: l.leaveType, am, pm });
+                    }
+                });
+
+                // Rule: RED ONLY IF 3 OR MORE PEOPLE OVERLAP IN THE SAME SLOT
+                let hasRedOverlap = (amCount >= 3 || pmCount >= 3);
+
+                let cellBg = 'bg-white border border-slate-200';
+                if (isHoliday || isWeekend) cellBg = 'bg-slate-100 text-slate-400 border-slate-200';
+                if (hasRedOverlap) cellBg = 'bg-rose-50 border border-rose-300 text-rose-800';
+
+                // JSON stringified data safely for modal popup
+                const jsonLeaves = JSON.stringify(dayLeaves).replace(/"/g, '&quot;');
+
+                calendarCells += `
+                    <div onclick="showDateDetails('${dateStr}', ${jsonLeaves}, ${hasRedOverlap})" class="h-20 ${cellBg} rounded-xl p-1 flex flex-col justify-between cursor-pointer hover:shadow-md transition relative overflow-hidden">
+                        <div class="flex justify-between items-center text-xs font-bold px-0.5">
+                            <span class="${hasRedOverlap ? 'text-rose-600' : 'text-slate-700'}">${day}</span>
+                            ${isHoliday ? '<span class="text-[8px] bg-amber-100 text-amber-700 px-1 rounded truncate max-w-[36px]">' + isHoliday + '</span>' : ''}
+                        </div>
+                        <div class="flex-1 overflow-y-auto cell-scroll space-y-0.5 mt-0.5 pr-0.5">
+                            ${dayLeaves.map(dl => {
+                                let timeBadge = dl.am && dl.pm ? '全' : (dl.am ? '上' : '下');
+                                return `<div class="text-[9px] px-1 py-0.5 rounded leading-tight font-medium flex justify-between items-center ${hasRedOverlap ? 'bg-rose-600 text-white' : 'bg-emerald-600 text-white'}">
+                                    <span class="truncate max-w-[32px]">${dl.name}</span>
+                                    <span class="text-[8px] opacity-90">${timeBadge}</span>
+                                </div>`;
+                            }).join('')}
+                        </div>
+                    </div>
+                `;
+            }
+
+            return `
+                <header class="bg-emerald-600 text-white p-4 flex justify-between items-center shadow-md">
+                    <div class="flex items-center space-x-3">
+                        <div class="w-10 h-10 bg-white/20 rounded-xl flex items-center justify-center font-bold">
+                            ${state.user.name.charAt(0)}
+                        </div>
+                        <div>
+                            <h2 class="font-bold leading-tight">${state.user.name}</h2>
+                            <p class="text-xs text-emerald-100">員工首頁</p>
+                        </div>
+                    </div>
+                    <button onclick="handleLogout()" class="bg-emerald-700 hover:bg-emerald-800 text-xs px-3 py-2 rounded-xl transition">
+                        <i class="fa-solid fa-right-from-bracket mr-1"></i>登出
+                    </button>
+                </header>
+
+                <main class="flex-1 p-4 space-y-4 overflow-y-auto pb-20">
+                    <!-- Action Buttons -->
+                    <div class="grid grid-cols-2 gap-3">
+                        <button onclick="navigate('request')" class="bg-gradient-to-br from-emerald-500 to-teal-600 text-white p-4 rounded-2xl shadow-lg shadow-emerald-600/20 flex flex-col items-center justify-center space-y-2 hover:opacity-95 transition">
+                            <i class="fa-solid fa-calendar-plus text-2xl"></i>
+                            <span class="font-bold text-sm">我要請假</span>
+                        </button>
+                        <button onclick="navigate('cancel')" class="bg-gradient-to-br from-slate-700 to-slate-900 text-white p-4 rounded-2xl shadow-lg shadow-slate-900/20 flex flex-col items-center justify-center space-y-2 hover:opacity-95 transition">
+                            <i class="fa-solid fa-calendar-xmark text-2xl"></i>
+                            <span class="font-bold text-sm">取消請假</span>
+                        </button>
+                    </div>
+
+                    <!-- Calendar Card -->
+                    <div class="bg-white border border-slate-200 rounded-2xl p-4 shadow-sm">
+                        <div class="flex justify-between items-center mb-4">
+                            <h3 class="font-bold text-slate-800 text-base">
+                                ${state.selectedYear}年 ${months[state.selectedMonth]}
+                            </h3>
+                            <div class="flex space-x-1">
+                                <button onclick="changeMonth(-1)" class="w-8 h-8 rounded-lg bg-slate-100 hover:bg-slate-200 flex items-center justify-center text-slate-600 transition">
+                                    <i class="fa-solid fa-chevron-left text-xs"></i>
+                                </button>
+                                <button onclick="changeMonth(1)" class="w-8 h-8 rounded-lg bg-slate-100 hover:bg-slate-200 flex items-center justify-center text-slate-600 transition">
+                                    <i class="fa-solid fa-chevron-right text-xs"></i>
+                                </button>
+                            </div>
+                        </div>
+
+                        <!-- Weekday Headers (Mon-Sun) -->
+                        <div class="grid grid-cols-7 gap-1 text-center text-xs font-semibold text-slate-400 mb-2">
+                            <div>一</div><div>二</div><div>三</div><div>四</div><div>五</div><div class="text-rose-500">六</div><div class="text-rose-500">日</div>
+                        </div>
+
+                        <!-- Grid -->
+                        <div class="grid grid-cols-7 gap-1">
+                            ${calendarCells}
+                        </div>
+                        <div class="mt-3 text-[11px] text-slate-500 flex flex-wrap gap-3 items-center justify-between border-t border-slate-100 pt-2">
+                            <span class="flex items-center"><span class="w-2.5 h-2.5 rounded-full bg-rose-500 inline-block mr-1"></span>紅色：同一時段 &ge; 3人放假</span>
+                            <span class="flex items-center"><span class="w-2.5 h-2.5 rounded-full bg-emerald-500 inline-block mr-1"></span>綠色：正常放假 (1-2人)</span>
+                        </div>
+                    </div>
+                </main>
+            `;
+        }
+
+        window.navigate = function(v) {
+            state.view = v;
+            render();
+        }
+
+        window.handleLogout = function() {
+            state.user = null;
+            state.view = 'login';
+            render();
+        }
+
+        window.changeMonth = function(dir) {
+            state.selectedMonth += dir;
+            if (state.selectedMonth > 11) {
+                state.selectedMonth = 0;
+                state.selectedYear += 1;
+                fetchHolidays(state.selectedYear);
+            } else if (state.selectedMonth < 0) {
+                state.selectedMonth = 11;
+                state.selectedYear -= 1;
+                fetchHolidays(state.selectedYear);
+            }
+            render();
+        }
+
+        // 3. Leave Request View
+        function renderRequest() {
+            const stats = getUserLeaveStats(state.user.name, state.selectedYear);
+
+            return `
+                <header class="bg-emerald-600 text-white p-4 flex items-center justify-between shadow-md">
+                    <button onclick="navigate('home')" class="text-white hover:bg-emerald-700 p-2 rounded-xl transition">
+                        <i class="fa-solid fa-arrow-left text-lg"></i>
+                    </button>
+                    <h2 class="font-bold text-base">申請請假</h2>
+                    <div class="w-8"></div>
+                </header>
+
+                <main class="flex-1 p-4 space-y-4 overflow-y-auto pb-20">
+                    <!-- Statistics Card (Jan 1 - Dec 31) -->
+                    <div class="bg-gradient-to-br from-slate-900 to-slate-800 text-white rounded-2xl p-4 shadow-lg">
+                        <h3 class="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-3">${state.selectedYear}年度已使用假期統計</h3>
+                        <div class="grid grid-cols-2 gap-3 text-sm">
+                            <div class="bg-white/10 rounded-xl p-3">
+                                <div class="text-slate-400 text-xs">Sick Leave</div>
+                                <div class="text-lg font-bold">${stats['Sick Leave']} 天</div>
+                            </div>
+                            <div class="bg-white/10 rounded-xl p-3">
+                                <div class="text-slate-400 text-xs">Annual Leave</div>
+                                <div class="text-lg font-bold">${stats['Annual Leave']} 天</div>
+                            </div>
+                            <div class="bg-white/10 rounded-xl p-3">
+                                <div class="text-slate-400 text-xs">Birthday (限1天)</div>
+                                <div class="text-lg font-bold ${stats['Birthday Leave'] >= 1 ? 'text-amber-400' : ''}">${stats['Birthday Leave']} / 1 天</div>
+                            </div>
+                            <div class="bg-white/10 rounded-xl p-3">
+                                <div class="text-slate-400 text-xs">Block (限5天連假)</div>
+                                <div class="text-lg font-bold ${stats['Block Leave'] >= 5 ? 'text-amber-400' : ''}">${stats['Block Leave']} / 5 天</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Form Card -->
+                    <div class="bg-white border border-slate-200 rounded-2xl p-4 shadow-sm space-y-4">
+                        <div>
+                            <label class="block text-xs font-semibold uppercase tracking-wider text-slate-500 mb-1">假期類別</label>
+                            <select id="leave-type" class="w-full bg-slate-100 border border-slate-200 rounded-xl px-4 py-3 text-slate-800 focus:outline-none focus:ring-2 focus:ring-emerald-500">
+                                <option value="Annual Leave">Annual Leave (年假)</option>
+                                <option value="Sick Leave">Sick Leave (病假)</option>
+                                <option value="Birthday Leave">Birthday Leave (生日假 - 每年限1天)</option>
+                                <option value="Block Leave">Block Leave (Block Leave - 每年限5個連續工作天)</option>
+                            </select>
+                        </div>
+
+                        <div class="grid grid-cols-2 gap-3">
+                            <div>
+                                <label class="block text-xs font-semibold uppercase tracking-wider text-slate-500 mb-1">開始日期</label>
+                                <input type="date" id="start-date" class="w-full bg-slate-100 border border-slate-200 rounded-xl px-3 py-2.5 text-slate-800 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500">
+                            </div>
+                            <div>
+                                <label class="block text-xs font-semibold uppercase tracking-wider text-slate-500 mb-1">開始時段</label>
+                                <select id="half-start" class="w-full bg-slate-100 border border-slate-200 rounded-xl px-3 py-2.5 text-slate-800 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500">
+                                    <option value="full">全日 (Full Day)</option>
+                                    <option value="am">上午 (Morning)</option>
+                                    <option value="pm">下午 (Afternoon)</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <div class="grid grid-cols-2 gap-3">
+                            <div>
+                                <label class="block text-xs font-semibold uppercase tracking-wider text-slate-500 mb-1">結束日期</label>
+                                <input type="date" id="end-date" class="w-full bg-slate-100 border border-slate-200 rounded-xl px-3 py-2.5 text-slate-800 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500">
+                            </div>
+                            <div>
+                                <label class="block text-xs font-semibold uppercase tracking-wider text-slate-500 mb-1">結束時段</label>
+                                <select id="half-end" class="w-full bg-slate-100 border border-slate-200 rounded-xl px-3 py-2.5 text-slate-800 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500">
+                                    <option value="full">全日 (Full Day)</option>
+                                    <option value="am">上午 (Morning)</option>
+                                    <option value="pm">下午 (Afternoon)</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <button onclick="submitLeaveRequest()" class="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-semibold py-3.5 rounded-xl shadow-lg shadow-emerald-600/30 transition mt-2">
+                            確認申請
+                        </button>
+                    </div>
+                </main>
+            `;
+        }
+
+        window.submitLeaveRequest = async function() {
+            const leaveType = document.getElementById('leave-type').value;
+            const startDate = document.getElementById('start-date').value;
+            const endDate = document.getElementById('end-date').value;
+            const halfStart = document.getElementById('half-start').value;
+            const halfEnd = document.getElementById('half-end').value;
+
+            if (!startDate || !endDate) {
+                showModal('資料不全', '請選擇開始與結束日期', 'warning');
+                return;
+            }
+
+            if (startDate > endDate) {
+                showModal('日期錯誤', '開始日期不能大於結束日期', 'warning');
+                return;
+            }
+
+            // Validate working days
+            let workingDays = getWorkingDaysBetween(startDate, endDate);
+            if (workingDays.length === 0) {
+                showModal('無效日期', '所選範圍內沒有任何有效工作天（星期一至五，且非公眾假期）', 'warning');
+                return;
+            }
+
+            // Specific Leave Rules
+            const stats = getUserLeaveStats(state.user.name, new Date(startDate).getFullYear());
+            let reqDaysCount = 0;
+            let slots = generateSlots(startDate, endDate, halfStart, halfEnd);
+            reqDaysCount = slots.length * 0.5;
+
+            if (leaveType === 'Birthday Leave') {
+                if (stats['Birthday Leave'] + reqDaysCount > 1) {
+                    showModal('額度超標', '生日假每年只限1天！', 'warning');
+                    return;
+                }
+                if (reqDaysCount !== 1) {
+                    showModal('規則錯誤', '生日假必須剛好請1整天', 'warning');
+                    return;
+                }
+            }
+
+            if (leaveType === 'Block Leave') {
+                if (stats['Block Leave'] + reqDaysCount > 5) {
+                    showModal('額度超標', 'Block leave 每年限5天！', 'warning');
+                    return;
+                }
+                if (workingDays.length !== 5 || reqDaysCount !== 5) {
+                    showModal('規則錯誤', 'Block leave 必須連續5個工作天', 'warning');
+                    return;
+                }
+            }
+
+            // Check concurrency overlap (3 OR MORE PEOPLE IN THE SAME SLOT)
+            const overlapCounts = getSlotOverlapCounts();
+            let hasConcurrencyWarning = false;
+            slots.forEach(slot => {
+                if ((overlapCounts[slot] || 0) >= 2) { 
+                    // Current count in database is >= 2, so adding 1 will make it >= 3
+                    hasConcurrencyWarning = true;
+                }
+            });
+
+            const executeSave = async () => {
+                const newLeave = {
+                    colleagueName: state.user.name,
+                    leaveType,
+                    startDate,
+                    endDate,
+                    halfDayStart: halfStart,
+                    halfDayEnd: halfEnd,
+                    slots,
+                    timestamp: new Date().toISOString()
+                };
+
+                if (db && auth && auth.currentUser) {
+                    try {
+                        const ref = collection(db, 'artifacts', appId, 'public', 'data', 'leaves');
+                        const docRef = await addDoc(ref, newLeave);
+                        newLeave.id = docRef.id;
+                    } catch(e) {
+                        console.error("Firestore save error:", e);
+                    }
+                } else {
+                    newLeave.id = 'local_' + Date.now();
+                    state.leaves.push(newLeave);
+                }
+
+                state.lastSubmittedLeave = newLeave;
+                state.view = 'success_share';
+                render();
+            };
+
+            if (hasConcurrencyWarning) {
+                showModal('注意：時段重疊', '該段時間將會有 3 位或以上同事同時請假，系統會將其標紅顯示，是否繼續送出？', 'warning', executeSave, true, '返回修改', '確認繼續');
+            } else {
+                await executeSave();
+            }
+        };
+
+        // 4. Success Share View (WhatsApp Image Export)
+        function renderSuccessShare() {
+            const leave = state.lastSubmittedLeave;
+            if (!leave) {
+                navigate('home');
+                return '';
+            }
+
+            return `
+                <header class="bg-emerald-600 text-white p-4 flex items-center justify-between shadow-md">
+                    <button onclick="navigate('home')" class="text-white hover:bg-emerald-700 p-2 rounded-xl transition">
+                        <i class="fa-solid fa-house text-lg"></i>
+                    </button>
+                    <h2 class="font-bold text-base">請假成功與分享</h2>
+                    <div class="w-8"></div>
+                </header>
+
+                <main class="flex-1 p-4 space-y-4 overflow-y-auto pb-20 flex flex-col items-center">
+                    <div class="w-full bg-emerald-50 border border-emerald-200 text-emerald-800 p-4 rounded-2xl text-center">
+                        <i class="fa-solid fa-circle-check text-3xl mb-2 text-emerald-600"></i>
+                        <h3 class="font-bold text-lg">請假申請已成功提交！</h3>
+                        <p class="text-xs text-slate-600 mt-1">您可以生成分享圖片並發送至 WhatsApp</p>
+                    </div>
+
+                    <!-- Shareable Card Canvas Container -->
+                    <div class="w-full bg-white border border-slate-200 rounded-2xl p-4 shadow-md flex flex-col items-center">
+                        <canvas id="shareCanvas" width="400" height="400" class="w-full rounded-xl shadow-inner bg-slate-900"></canvas>
+                        
+                        <div class="flex gap-3 w-full mt-4">
+                            <button onclick="downloadShareImage()" class="flex-1 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold py-3 rounded-xl shadow-lg shadow-emerald-600/30 transition flex items-center justify-center space-x-2">
+                                <i class="fa-solid fa-download"></i>
+                                <span>下載圖片</span>
+                            </button>
+                            <button onclick="shareToWhatsApp()" class="flex-1 bg-teal-600 hover:bg-teal-700 text-white font-semibold py-3 rounded-xl shadow-lg shadow-teal-600/30 transition flex items-center justify-center space-x-2">
+                                <i class="fa-brands fa-whatsapp text-lg"></i>
+                                <span>WhatsApp 分享</span>
+                            </button>
+                        </div>
+                    </div>
+                </main>
+            `;
+        }
+
+        // Draw Shareable Canvas Image
+        setTimeout(() => {
+            if (state.view === 'success_share' && state.lastSubmittedLeave) {
+                drawCanvasCard();
+            }
+        }, 100);
+
+        function drawCanvasCard() {
+            const canvas = document.getElementById('shareCanvas');
+            if (!canvas) return;
+            const ctx = canvas.getContext('2d');
+            const leave = state.lastSubmittedLeave;
+
+            // Background
+            ctx.fillStyle = '#0f172a';
+            ctx.fillRect(0, 0, 400, 400);
+
+            // Header Banner
+            ctx.fillStyle = '#059669';
+            ctx.fillRect(0, 0, 400, 80);
+
+            ctx.fillStyle = '#ffffff';
+            ctx.font = 'bold 20px Inter, sans-serif';
+            ctx.fillText('📅 產品组請假動態通知', 20, 45);
+
+            // Content Box
+            ctx.fillStyle = '#1e293b';
+            ctx.roundRect(20, 100, 360, 270, 16);
+            ctx.fill();
+
+            ctx.fillStyle = '#94a3b8';
+            ctx.font = '12px Inter, sans-serif';
+            ctx.fillText('同事姓名', 40, 135);
+            ctx.fillText('假期類別', 40, 185);
+            ctx.fillText('請假日期範圍', 40, 235);
+
+            ctx.fillStyle = '#ffffff';
+            ctx.font = 'bold 16px Inter, sans-serif';
+            ctx.fillText(leave.colleagueName, 40, 155);
+            ctx.fillText(leave.leaveType, 40, 205);
+            ctx.font = '14px Inter, sans-serif';
+            ctx.fillText(`${leave.startDate} 至 ${leave.endDate}`, 40, 255);
+
+            // Overlap status check - RED ONLY IF >= 3
+            const overlapCounts = getSlotOverlapCounts();
+            let isOverlappingRed = (leave.slots || []).some(s => (overlapCounts[s] || 0) >= 3);
+
+            ctx.fillStyle = isOverlappingRed ? '#ef4444' : '#10b981';
+            ctx.roundRect(40, 285, 320, 45, 10);
+            ctx.fill();
+
+            ctx.fillStyle = '#ffffff';
+            ctx.font = 'bold 13px Inter, sans-serif';
+            ctx.fillText(isOverlappingRed ? '⚠️ 注意：該段時間有 >=3 人重疊請假 (已標紅)' : '✅ 該時段人員安排正常', 60, 313);
+        }
+
+        window.downloadShareImage = function() {
+            const canvas = document.getElementById('shareCanvas');
+            if (!canvas) return;
+            const link = document.createElement('a');
+            link.download = `leave_${state.lastSubmittedLeave.colleagueName}_${state.lastSubmittedLeave.startDate}.png`;
+            link.href = canvas.toDataURL('image/png');
+            link.click();
+        }
+
+        window.shareToWhatsApp = function() {
+            const leave = state.lastSubmittedLeave;
+            const text = encodeURIComponent(`【請假通知】\n同事：${leave.colleagueName}\n類別：${leave.leaveType}\n日期：${leave.startDate} 至 ${leave.endDate}\n請大家留意工作交接！`);
+            window.open(`https://api.whatsapp.com/send?text=${text}`, '_blank');
+        }
+
+        // 5. Cancel Leave View
+        function renderCancel() {
+            const todayStr = new Date().toISOString().split('T')[0];
+            const myLeaves = state.leaves.filter(l => l.colleagueName === state.user.name && l.startDate >= todayStr);
+
+            return `
+                <header class="bg-slate-900 text-white p-4 flex items-center justify-between shadow-md">
+                    <button onclick="navigate('home')" class="text-white hover:bg-slate-800 p-2 rounded-xl transition">
+                        <i class="fa-solid fa-arrow-left text-lg"></i>
+                    </button>
+                    <h2 class="font-bold text-base">取消未來的請假</h2>
+                    <div class="w-8"></div>
+                </header>
+
+                <main class="flex-1 p-4 space-y-3 overflow-y-auto pb-20">
+                    ${myLeaves.length === 0 ? `
+                        <div class="text-center py-12 text-slate-400">
+                            <i class="fa-solid fa-calendar-check text-4xl mb-3"></i>
+                            <p class="text-sm">您目前沒有任何未來的請假紀錄可取消</p>
+                        </div>
+                    ` : myLeaves.map(l => `
+                        <div class="bg-white border border-slate-200 rounded-2xl p-4 shadow-sm flex justify-between items-center">
+                            <div>
+                                <span class="text-xs bg-slate-100 text-slate-700 px-2 py-1 rounded-lg font-medium">${l.leaveType}</span>
+                                <div class="font-bold text-slate-800 mt-2">${l.startDate} 至 ${l.endDate}</div>
+                                <div class="text-xs text-slate-500 mt-0.5">時段：${l.halfDayStart} ~ ${l.halfDayEnd}</div>
+                            </div>
+                            <button onclick="confirmCancelLeave('${l.id}')" class="bg-rose-50 text-rose-600 hover:bg-rose-100 font-semibold text-xs px-3.5 py-2 rounded-xl transition">
+                                取消請假
+                            </button>
+                        </div>
+                    `).join('')}
+                </main>
+            `;
+        }
+
+        window.confirmCancelLeave = function(leaveId) {
+            showModal('確認取消', '您確定要取消這筆請假紀錄嗎？', 'warning', async () => {
+                if (db && auth) {
+                    try {
+                        await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'leaves', leaveId));
+                    } catch(e) {
+                        console.error("Delete leave error:", e);
+                    }
+                } else {
+                    state.leaves = state.leaves.filter(l => l.id !== leaveId);
+                    render();
+                }
+                showModal('已取消', '請假紀錄已成功取消', 'success');
+            }, true, '返回', '確認取消');
+        };
+
+        // 6. Admin Home View
+        function renderAdminHome() {
+            return `
+                <header class="bg-slate-900 text-white p-4 flex justify-between items-center shadow-md">
+                    <div class="flex items-center space-x-3">
+                        <div class="w-10 h-10 bg-emerald-600 rounded-xl flex items-center justify-center font-bold">
+                            A
+                        </div>
+                        <div>
+                            <h2 class="font-bold leading-tight">系統管理員</h2>
+                            <p class="text-xs text-slate-400">Admin Dashboard</p>
+                        </div>
+                    </div>
+                    <button onclick="handleLogout()" class="bg-slate-800 hover:bg-slate-700 text-xs px-3 py-2 rounded-xl transition">
+                        <i class="fa-solid fa-right-from-bracket mr-1"></i>登出
+                    </button>
+                </header>
+
+                <main class="flex-1 p-4 space-y-4 overflow-y-auto pb-20">
+                    <div class="grid grid-cols-1 gap-4">
+                        <button onclick="navigate('admin_colleagues')" class="bg-white border border-slate-200 p-5 rounded-2xl shadow-sm flex items-center justify-between hover:border-emerald-500 transition">
+                            <div class="flex items-center space-x-4">
+                                <div class="w-12 h-12 bg-emerald-50 text-emerald-600 rounded-xl flex items-center justify-center text-xl font-bold">
+                                    <i class="fa-solid fa-users"></i>
+                                </div>
+                                <div class="text-left">
+                                    <h3 class="font-bold text-slate-800">管理同事帳號</h3>
+                                    <p class="text-xs text-slate-500">增加或刪除同事及其請假紀錄</p>
+                                </div>
+                            </div>
+                            <i class="fa-solid fa-chevron-right text-slate-400"></i>
+                        </button>
+
+                        <button onclick="navigate('admin_leaves')" class="bg-white border border-slate-200 p-5 rounded-2xl shadow-sm flex items-center justify-between hover:border-emerald-500 transition">
+                            <div class="flex items-center space-x-4">
+                                <div class="w-12 h-12 bg-teal-50 text-teal-600 rounded-xl flex items-center justify-center text-xl font-bold">
+                                    <i class="fa-solid fa-calendar-days"></i>
+                                </div>
+                                <div class="text-left">
+                                    <h3 class="font-bold text-slate-800">管理所有請假紀錄</h3>
+                                    <p class="text-xs text-slate-500">修改或刪除任何同事的請假紀錄</p>
+                                </div>
+                            </div>
+                            <i class="fa-solid fa-chevron-right text-slate-400"></i>
+                        </button>
+                    </div>
+                </main>
+            `;
+        }
+
+        // 7. Admin Colleagues Management (Add / Delete)
+        function renderAdminColleagues() {
+            return `
+                <header class="bg-slate-900 text-white p-4 flex items-center justify-between shadow-md">
+                    <button onclick="navigate('admin_home')" class="text-white hover:bg-slate-800 p-2 rounded-xl transition">
+                        <i class="fa-solid fa-arrow-left text-lg"></i>
+                    </button>
+                    <h2 class="font-bold text-base">管理同事帳號</h2>
+                    <div class="w-8"></div>
+                </header>
+
+                <main class="flex-1 p-4 space-y-4 overflow-y-auto pb-20">
+                    <!-- Add Colleague Form -->
+                    <div class="bg-white border border-slate-200 rounded-2xl p-4 shadow-sm space-y-3">
+                        <h3 class="font-bold text-slate-800 text-sm">增加新同事</h3>
+                        <div>
+                            <label class="block text-xs font-semibold text-slate-500 mb-1">同事名稱</label>
+                            <input type="text" id="new-colleague-name" placeholder="請輸入姓名" class="w-full bg-slate-100 border border-slate-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500">
+                        </div>
+                        <div>
+                            <label class="block text-xs font-semibold text-slate-500 mb-1">初始密碼</label>
+                            <input type="password" id="new-colleague-pass" placeholder="請設定密碼" class="w-full bg-slate-100 border border-slate-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500">
+                        </div>
+                        <button onclick="handleAddColleague()" class="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-semibold py-2.5 rounded-xl transition text-sm">
+                            新增同事
+                        </button>
+                    </div>
+
+                    <!-- Colleagues List -->
+                    <div class="space-y-2">
+                        <h3 class="font-bold text-slate-800 text-sm mt-4">現有同事列表</h3>
+                        ${state.colleagues.length === 0 ? '<p class="text-xs text-slate-400">暫無同事</p>' : state.colleagues.map(c => `
+                            <div class="bg-white border border-slate-200 rounded-xl p-3 flex justify-between items-center shadow-xs">
+                                <div>
+                                    <div class="font-bold text-slate-800 text-sm">${c.name}</div>
+                                    <div class="text-xs text-slate-400">密碼: ${c.password}</div>
+                                </div>
+                                <button onclick="handleDeleteColleague('${c.id}', '${c.name}')" class="bg-rose-50 text-rose-600 hover:bg-rose-100 px-3 py-1.5 rounded-lg text-xs font-semibold transition">
+                                    刪除
+                                </button>
+                            </div>
+                        `).join('')}
+                    </div>
+                </main>
+            `;
+        }
+
+        window.handleAddColleague = async function() {
+            const name = document.getElementById('new-colleague-name').value.trim();
+            const pass = document.getElementById('new-colleague-pass').value.trim();
+
+            if (!name || !pass) {
+                showModal('資料不全', '請輸入同事名稱與密碼', 'warning');
+                return;
+            }
+
+            if (state.colleagues.some(c => c.name === name)) {
+                showModal('名稱重複', '此同事名稱已存在', 'warning');
+                return;
+            }
+
+            const newCol = { name, password: pass };
+            if (db && auth) {
+                try {
+                    await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'colleagues'), newCol);
+                } catch(e) {
+                    console.error("Add colleague error:", e);
+                }
+            } else {
+                newCol.id = 'c_' + Date.now();
+                state.colleagues.push(newCol);
+                render();
+            }
+
+            document.getElementById('new-colleague-name').value = '';
+            document.getElementById('new-colleague-pass').value = '';
+            showModal('成功', '同事已成功新增', 'success');
+        };
+
+        window.handleDeleteColleague = function(colleagueId, colleagueName) {
+            showModal('確認刪除', `確定要刪除同事 "${colleagueName}" 嗎？同時會刪除該同事的所有請假紀錄！`, 'warning', async () => {
+                if (db && auth) {
+                    try {
+                        await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'colleagues', colleagueId));
+                        const leavesToDelete = state.leaves.filter(l => l.colleagueName === colleagueName);
+                        for (let l of leavesToDelete) {
+                            await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'leaves', l.id));
+                        }
+                    } catch(e) {
+                        console.error("Delete colleague error:", e);
+                    }
+                } else {
+                    state.colleagues = state.colleagues.filter(c => c.id !== colleagueId);
+                    state.leaves = state.leaves.filter(l => l.colleagueName !== colleagueName);
+                    render();
+                }
+                showModal('已刪除', '同事及相關請假紀錄已刪除', 'success');
+            }, true, '取消', '確認刪除');
+        };
+
+        // 8. Admin Leave Records Management (Edit / Delete)
+        function renderAdminLeaves() {
+            return `
+                <header class="bg-slate-900 text-white p-4 flex items-center justify-between shadow-md">
+                    <button onclick="navigate('admin_home')" class="text-white hover:bg-slate-800 p-2 rounded-xl transition">
+                        <i class="fa-solid fa-arrow-left text-lg"></i>
+                    </button>
+                    <h2 class="font-bold text-base">管理請假紀錄</h2>
+                    <div class="w-8"></div>
+                </header>
+
+                <main class="flex-1 p-4 space-y-3 overflow-y-auto pb-20">
+                    ${state.leaves.length === 0 ? '<p class="text-center py-12 text-slate-400 text-sm">暫無任何請假紀錄</p>' : state.leaves.map(l => `
+                        <div class="bg-white border border-slate-200 rounded-2xl p-4 shadow-sm flex justify-between items-center">
+                            <div>
+                                <div class="flex items-center space-x-2">
+                                    <span class="font-bold text-slate-900">${l.colleagueName}</span>
+                                    <span class="text-xs bg-slate-100 text-slate-700 px-2 py-0.5 rounded font-medium">${l.leaveType}</span>
+                                </div>
+                                <div class="text-xs text-slate-600 mt-1">${l.startDate} 至 ${l.endDate}</div>
+                                <div class="text-[10px] text-slate-400 mt-0.5">時段: ${l.halfDayStart} ~ ${l.halfDayEnd}</div>
+                            </div>
+                            <div class="flex space-x-2">
+                                <button onclick="adminDeleteLeave('${l.id}')" class="bg-rose-50 text-rose-600 hover:bg-rose-100 px-3 py-1.5 rounded-xl text-xs font-semibold transition">
+                                    刪除
+                                </button>
+                            </div>
+                        </div>
+                    `).join('')}
+                </main>
+            `;
+        }
+
+        window.adminDeleteLeave = function(leaveId) {
+            showModal('確認刪除', '確定要刪除這筆請假紀錄嗎？', 'warning', async () => {
+                if (db && auth) {
+                    try {
+                        await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'leaves', leaveId));
+                    } catch(e) {
+                        console.error("Admin delete leave error:", e);
+                    }
+                } else {
+                    state.leaves = state.leaves.filter(l => l.id !== leaveId);
+                    render();
+                }
+                showModal('已刪除', '請假紀錄已成功刪除', 'success');
+            }, true, '取消', '確認刪除');
+        };
+
+        // Start initialization on window load
+        window.onload = function() {
+            initFirebase();
+        };
+    </script>
+</body>
+</html>
